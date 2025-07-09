@@ -5,6 +5,7 @@ const (
 	CommandTypeCreate        = "CREATE"
 	CommandTypeRequestAdd    = "REQUEST_ADD"
 	CommandTypeRequestDelete = "REQUEST_DELETE"
+	CommandTypeUpdateCapacity = "UPDATE_CAPACITY"
 )
 
 type Command[E any] struct {
@@ -26,6 +27,10 @@ type RequestAddBuddyCommandBody struct {
 
 type RequestDeleteBuddyCommandBody struct {
 	CharacterId uint32 `json:"characterId"`
+}
+
+type UpdateCapacityCommandBody struct {
+	Capacity byte `json:"capacity"`
 }
 
 const (
