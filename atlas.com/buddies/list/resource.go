@@ -21,6 +21,7 @@ const (
 	CreateBuddyList       = "create_buddy_list"
 	GetBuddiesInBuddyList = "get_buddies_in_buddy_list"
 	AddBuddyToBuddyList   = "add_buddy_to_buddy_list"
+	UpdateBuddyListCapacity = "update_buddy_list_capacity"
 )
 
 func InitResource(si jsonapi.ServerInformation) func(db *gorm.DB) server.RouteInitializer {
@@ -32,6 +33,7 @@ func InitResource(si jsonapi.ServerInformation) func(db *gorm.DB) server.RouteIn
 			r.HandleFunc("", rest.RegisterInputHandler[RestModel](l)(si)(CreateBuddyList, handleCreateBuddyList)).Methods(http.MethodPost)
 			r.HandleFunc("/buddies", registerGet(GetBuddiesInBuddyList, handleGetBuddiesInBuddyList(db))).Methods(http.MethodGet)
 			r.HandleFunc("/buddies", rest.RegisterInputHandler[buddy.RestModel](l)(si)(AddBuddyToBuddyList, handleAddBuddyToBuddyList)).Methods(http.MethodPost)
+			r.HandleFunc("/capacity", rest.RegisterInputHandler[RestModel](l)(si)(UpdateBuddyListCapacity, handleUpdateBuddyListCapacity)).Methods(http.MethodPut)
 		}
 	}
 }
@@ -111,6 +113,31 @@ func handleAddBuddyToBuddyList(d *rest.HandlerDependency, _ *rest.HandlerContext
 			//	w.WriteHeader(http.StatusInternalServerError)
 			//	return
 			//}
+
+			w.WriteHeader(http.StatusAccepted)
+		}
+	})
+}
+
+func handleUpdateBuddyListCapacity(d *rest.HandlerDependency, _ *rest.HandlerContext, i RestModel) http.HandlerFunc {
+	return rest.ParseCharacterId(d.Logger(), func(characterId uint32) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			// Validate capacity
+			if i.Capacity == 0 {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+
+			// Use default worldId for REST endpoints
+			worldId := byte(1)
+
+			// Send capacity update command
+			err := producer.ProviderImpl(d.Logger())(d.Context())(list2.EnvCommandTopic)(UpdateCapacityCommandProvider(characterId, worldId, i.Capacity))
+			if err != nil {
+				d.Logger().WithError(err).Errorf("Error sending capacity update command for character [%d]", characterId)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
 
 			w.WriteHeader(http.StatusAccepted)
 		}
