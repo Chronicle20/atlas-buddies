@@ -140,3 +140,31 @@ func deleteEntityWithBuddies(db *gorm.DB, tenantId uuid.UUID, characterId uint32
 
 	return nil
 }
+
+func updateCapacity(db *gorm.DB) func(tenantId uuid.UUID) func(characterId uint32) func(capacity byte) error {
+	return func(tenantId uuid.UUID) func(characterId uint32) func(capacity byte) error {
+		return func(characterId uint32) func(capacity byte) error {
+			return func(capacity byte) error {
+				if capacity == 0 {
+					return errors.New("capacity must be greater than 0")
+				}
+
+				// Find the entity
+				e, err := byCharacterIdEntityProvider(tenantId, characterId)(db)()
+				if err != nil {
+					return err
+				}
+
+				// Check if new capacity is less than current buddy count
+				currentBuddyCount := len(e.Buddies)
+				if int(capacity) < currentBuddyCount {
+					return fmt.Errorf("new capacity %d is less than current buddy count %d", capacity, currentBuddyCount)
+				}
+
+				// Update capacity
+				e.Capacity = capacity
+				return db.Model(&Entity{}).Where("id = ?", e.Id).Update("capacity", capacity).Error
+			}
+		}
+	}
+}
