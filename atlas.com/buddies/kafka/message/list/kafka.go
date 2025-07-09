@@ -42,6 +42,8 @@ const (
 	StatusEventErrorAlreadyBuddy      = "ALREADY_BUDDY"
 	StatusEventErrorCannotBuddyGm     = "CANNOT_BUDDY_GM"
 	StatusEventErrorCharacterNotFound = "CHARACTER_NOT_FOUND"
+	StatusEventErrorInvalidCapacity   = "INVALID_CAPACITY"
+	StatusEventErrorCapacityTooSmall  = "CAPACITY_TOO_SMALL"
 	StatusEventErrorUnknownError      = "UNKNOWN_ERROR"
 )
 

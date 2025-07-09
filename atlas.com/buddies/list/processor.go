@@ -36,6 +36,8 @@ type Processor interface {
 	UpdateBuddyChannel(mb *message.Buffer) func(characterId uint32, worldId byte, channelId int8) error
 	UpdateBuddyShopStatusAndEmit(characterId uint32, worldId byte, inShop bool) error
 	UpdateBuddyShopStatus(mb *message.Buffer) func(characterId uint32, worldId byte, inShop bool) error
+	UpdateCapacityAndEmit(characterId uint32, worldId byte, capacity byte) error
+	UpdateCapacity(mb *message.Buffer) func(characterId uint32, worldId byte, capacity byte) error
 }
 
 type ProcessorImpl struct {
@@ -497,6 +499,58 @@ func (p *ProcessorImpl) UpdateBuddyShopStatus(mb *message.Buffer) func(character
 		})
 		if txErr != nil {
 			p.l.WithError(txErr).Errorf("Unable to update buddy shop status for character [%d].", characterId)
+			return txErr
+		}
+		return nil
+	}
+}
+
+func (p *ProcessorImpl) UpdateCapacityAndEmit(characterId uint32, worldId byte, capacity byte) error {
+	return message.Emit(p.p)(func(buf *message.Buffer) error {
+		return p.UpdateCapacity(buf)(characterId, worldId, capacity)
+	})
+}
+
+func (p *ProcessorImpl) UpdateCapacity(mb *message.Buffer) func(characterId uint32, worldId byte, capacity byte) error {
+	return func(characterId uint32, worldId byte, capacity byte) error {
+		txErr := database.ExecuteTransaction(p.db, func(tx *gorm.DB) error {
+			// Get current buddy list to check current buddy count
+			bl, err := p.WithTransaction(tx).GetByCharacterId(characterId)
+			if err != nil {
+				p.l.WithError(err).Errorf("Unable to retrieve buddy list for character [%d] for capacity update.", characterId)
+				_ = mb.Put(list2.EnvStatusEventTopic, list3.ErrorStatusEventProvider(characterId, worldId, list2.StatusEventErrorUnknownError))
+				return err
+			}
+
+			// Validate capacity
+			if capacity == 0 {
+				p.l.Infof("Invalid capacity [%d] for character [%d] buddy list.", capacity, characterId)
+				_ = mb.Put(list2.EnvStatusEventTopic, list3.ErrorStatusEventProvider(characterId, worldId, list2.StatusEventErrorInvalidCapacity))
+				return errors.New("capacity must be greater than 0")
+			}
+
+			// Check if new capacity is less than current buddy count
+			currentBuddyCount := len(bl.Buddies())
+			if int(capacity) < currentBuddyCount {
+				p.l.Infof("New capacity [%d] is less than current buddy count [%d] for character [%d].", capacity, currentBuddyCount, characterId)
+				_ = mb.Put(list2.EnvStatusEventTopic, list3.ErrorStatusEventProvider(characterId, worldId, list2.StatusEventErrorCapacityTooSmall))
+				return errors.New("new capacity is less than current buddy count")
+			}
+
+			// Update capacity using administrator function
+			err = updateCapacity(tx)(p.t.Id())(characterId)(capacity)
+			if err != nil {
+				p.l.WithError(err).Errorf("Unable to update capacity for character [%d] buddy list.", characterId)
+				_ = mb.Put(list2.EnvStatusEventTopic, list3.ErrorStatusEventProvider(characterId, worldId, list2.StatusEventErrorUnknownError))
+				return err
+			}
+
+			// Emit capacity change event
+			_ = mb.Put(list2.EnvStatusEventTopic, list3.BuddyCapacityChangeStatusEventProvider(characterId, worldId, capacity))
+			return nil
+		})
+		if txErr != nil {
+			p.l.WithError(txErr).Errorf("Unable to update capacity for character [%d] buddy list.", characterId)
 			return txErr
 		}
 		return nil
