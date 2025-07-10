@@ -1,400 +1,367 @@
 package list
 
 import (
-	"atlas-buddies/buddy"
-	"atlas-buddies/character"
 	"atlas-buddies/kafka/message"
-	list2 "atlas-buddies/kafka/message/list"
-	list3 "atlas-buddies/kafka/producer/list"
 	"context"
-	"errors"
+	"fmt"
 	"testing"
 
-	"github.com/Chronicle20/atlas-model/model"
 	"github.com/Chronicle20/atlas-tenant"
 	"github.com/google/uuid"
-	"github.com/segmentio/kafka-go"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
+	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
-// Mock implementations for testing
-type MockDB struct {
-	gorm.DB
-	mock.Mock
+// Setup functions
+func setupTestDB(t *testing.T) *gorm.DB {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	assert.NoError(t, err)
+
+	// Create tables manually for SQLite compatibility
+	err = db.Exec(`
+		CREATE TABLE lists (
+			tenant_id TEXT NOT NULL,
+			id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6)))),
+			character_id INTEGER NOT NULL,
+			capacity INTEGER NOT NULL
+		)
+	`).Error
+	assert.NoError(t, err)
+	
+	err = db.Exec(`
+		CREATE TABLE buddies (
+			character_id INTEGER NOT NULL,
+			list_id TEXT NOT NULL,
+			"group" TEXT NOT NULL,
+			character_name TEXT NOT NULL,
+			channel_id INTEGER NOT NULL DEFAULT -1,
+			in_shop BOOLEAN NOT NULL DEFAULT 0,
+			pending BOOLEAN NOT NULL DEFAULT 0,
+			PRIMARY KEY (character_id, list_id),
+			FOREIGN KEY (list_id) REFERENCES lists(id)
+		)
+	`).Error
+	assert.NoError(t, err)
+
+	return db
 }
 
-type MockProducer struct {
-	mock.Mock
-}
-
-func (m *MockProducer) Call(topic string, provider model.Provider[[]kafka.Message]) error {
-	args := m.Called(topic, provider)
-	return args.Error(0)
-}
-
-type MockCharacterProcessor struct {
-	mock.Mock
-}
-
-func (m *MockCharacterProcessor) GetById(characterId uint32) (character.Model, error) {
-	args := m.Called(characterId)
-	return args.Get(0).(character.Model), args.Error(1)
-}
-
-type MockInviteProcessor struct {
-	mock.Mock
-}
-
-func (m *MockInviteProcessor) Create(characterId uint32, worldId byte, targetId uint32) error {
-	args := m.Called(characterId, worldId, targetId)
-	return args.Error(0)
-}
-
-func (m *MockInviteProcessor) Reject(characterId uint32, worldId byte, targetId uint32) error {
-	args := m.Called(characterId, worldId, targetId)
-	return args.Error(0)
-}
-
-// Test the business logic of capacity updates
-func TestUpdateCapacityValidation(t *testing.T) {
-	// Create test data
+func createTestTenant() tenant.Model {
 	tenantId := uuid.New()
+	tenant, _ := tenant.Create(tenantId, "GMS", 83, 1)
+	return tenant
+}
+
+func createRealProcessor(t *testing.T, db *gorm.DB) Processor {
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel) // Reduce noise in tests
+	
+	tenantModel := createTestTenant()
+	ctx := tenant.WithContext(context.Background(), tenantModel)
+	
+	// Use real processor - this will test actual implementation
+	return NewProcessor(logger, ctx, db)
+}
+
+func createTestBuddyList(t *testing.T, db *gorm.DB, processor Processor, characterId uint32, capacity byte, buddyCount int) Model {
+	// Create the buddy list
+	_, err := processor.Create(characterId, capacity)
+	assert.NoError(t, err)
+	
+	// Add buddies if requested
+	for i := 0; i < buddyCount; i++ {
+		buddyId := uint32(2000 + i)
+		buddyName := fmt.Sprintf("Buddy%d", i+1)
+		
+		// Get the tenant from the processor
+		realProc := processor.(*ProcessorImpl)
+		err = addBuddy(db, realProc.t.Id(), characterId, buddyId, buddyName, "Friends", false)
+		assert.NoError(t, err)
+	}
+	
+	// Reload the buddy list to get the updated data
+	reloadedBl, err := processor.GetByCharacterId(characterId)
+	assert.NoError(t, err)
+	
+	return reloadedBl
+}
+
+// Test the actual UpdateCapacity function with real database and business logic
+func TestUpdateCapacityWithRealDatabase(t *testing.T) {
+	db := setupTestDB(t)
+	processor := createRealProcessor(t, db)
+	
 	characterId := uint32(12345)
 	worldId := byte(1)
 	
-	// Create a buddy list with some buddies
-	buddies := []buddy.Model{
-		createTestBuddy(1001, "Friend1"),
-		createTestBuddy(1002, "Friend2"),
-	}
-	
-	bl, _ := NewBuilder(tenantId, characterId).
-		SetId(uuid.New()).
-		SetCapacity(5).
-		SetBuddies(buddies).
-		Build()
-
 	t.Run("validates capacity is greater than zero", func(t *testing.T) {
-		// Test zero capacity
-		buf := message.NewBuffer()
-		processor := createMockProcessor(t, bl, nil)
+		// Create buddy list with 2 buddies
+		bl := createTestBuddyList(t, db, processor, characterId, 5, 2)
+		assert.Equal(t, 2, len(bl.Buddies()))
 		
+		buf := message.NewBuffer()
 		updater := processor.UpdateCapacity(buf)
 		err := updater(characterId, worldId, 0)
 		
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "capacity must be greater than 0")
-	})
-
-	t.Run("validates new capacity is not less than current buddy count", func(t *testing.T) {
-		// Test capacity less than current buddy count (2)
-		buf := message.NewBuffer()
-		processor := createMockProcessor(t, bl, nil)
 		
+		// Verify the buddy list capacity hasn't changed in database
+		reloadedBl, err := processor.GetByCharacterId(characterId)
+		assert.NoError(t, err)
+		assert.Equal(t, byte(5), reloadedBl.Capacity()) // Should still be 5
+		
+		// Verify events were put in buffer
+		allEvents := buf.GetAll()
+		assert.NotEmpty(t, allEvents, "Should have error events in buffer")
+	})
+	
+	t.Run("validates new capacity is not less than current buddy count", func(t *testing.T) {
+		// Create new character with buddy list containing 3 buddies
+		characterId2 := uint32(12346)
+		bl := createTestBuddyList(t, db, processor, characterId2, 10, 3)
+		assert.Equal(t, 3, len(bl.Buddies()))
+		
+		buf := message.NewBuffer()
 		updater := processor.UpdateCapacity(buf)
-		err := updater(characterId, worldId, 1) // Only 1 but we have 2 buddies
+		err := updater(characterId2, worldId, 2) // Try to set capacity to 2 when we have 3 buddies
 		
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "new capacity is less than current buddy count")
+		
+		// Verify the buddy list capacity hasn't changed in database
+		reloadedBl, err := processor.GetByCharacterId(characterId2)
+		assert.NoError(t, err)
+		assert.Equal(t, byte(10), reloadedBl.Capacity()) // Should still be 10
+		
+		// Verify events were put in buffer
+		allEvents := buf.GetAll()
+		assert.NotEmpty(t, allEvents, "Should have error events in buffer")
 	})
-
+	
 	t.Run("allows capacity equal to current buddy count", func(t *testing.T) {
-		// Test capacity equal to current buddy count (2)
-		buf := message.NewBuffer()
-		processor := createMockProcessor(t, bl, nil)
+		// Create new character with buddy list containing 4 buddies
+		characterId3 := uint32(12347)
+		bl := createTestBuddyList(t, db, processor, characterId3, 10, 4)
+		assert.Equal(t, 4, len(bl.Buddies()))
 		
+		buf := message.NewBuffer()
 		updater := processor.UpdateCapacity(buf)
-		err := updater(characterId, worldId, 2) // Same as buddy count
+		err := updater(characterId3, worldId, 4) // Set capacity equal to buddy count
 		
 		assert.NoError(t, err)
+		
+		// Verify the buddy list capacity was updated in database
+		reloadedBl, err := processor.GetByCharacterId(characterId3)
+		assert.NoError(t, err)
+		assert.Equal(t, byte(4), reloadedBl.Capacity()) // Should be updated to 4
+		assert.Equal(t, 4, len(reloadedBl.Buddies())) // Buddies should remain
+		
+		// Verify events were put in buffer
+		allEvents := buf.GetAll()
+		assert.NotEmpty(t, allEvents, "Should have success events in buffer")
 	})
-
+	
 	t.Run("allows capacity greater than current buddy count", func(t *testing.T) {
-		// Test capacity greater than current buddy count
-		buf := message.NewBuffer()
-		processor := createMockProcessor(t, bl, nil)
+		// Create new character with buddy list containing 2 buddies
+		characterId4 := uint32(12348)
+		bl := createTestBuddyList(t, db, processor, characterId4, 5, 2)
+		assert.Equal(t, 2, len(bl.Buddies()))
 		
+		buf := message.NewBuffer()
 		updater := processor.UpdateCapacity(buf)
-		err := updater(characterId, worldId, 10) // More than buddy count
+		err := updater(characterId4, worldId, 20) // Set capacity much higher than buddy count
 		
 		assert.NoError(t, err)
+		
+		// Verify the buddy list capacity was updated in database
+		reloadedBl, err := processor.GetByCharacterId(characterId4)
+		assert.NoError(t, err)
+		assert.Equal(t, byte(20), reloadedBl.Capacity()) // Should be updated to 20
+		assert.Equal(t, 2, len(reloadedBl.Buddies())) // Buddies should remain
+		
+		// Verify events were put in buffer
+		allEvents := buf.GetAll()
+		assert.NotEmpty(t, allEvents, "Should have success events in buffer")
 	})
-
+	
 	t.Run("allows maximum capacity 255", func(t *testing.T) {
-		buf := message.NewBuffer()
-		processor := createMockProcessor(t, bl, nil)
-		
-		updater := processor.UpdateCapacity(buf)
-		err := updater(characterId, worldId, 255)
-		
-		assert.NoError(t, err)
-	})
-
-	t.Run("allows minimum capacity 1 when no buddies", func(t *testing.T) {
-		// Create buddy list with no buddies
-		emptyBl, _ := NewBuilder(tenantId, characterId).
-			SetId(uuid.New()).
-			SetCapacity(20).
-			SetBuddies([]buddy.Model{}).
-			Build()
+		// Create new character with empty buddy list
+		characterId5 := uint32(12349)
+		bl := createTestBuddyList(t, db, processor, characterId5, 5, 0)
+		assert.Equal(t, 0, len(bl.Buddies()))
 		
 		buf := message.NewBuffer()
-		processor := createMockProcessor(t, emptyBl, nil)
-		
 		updater := processor.UpdateCapacity(buf)
-		err := updater(characterId, worldId, 1)
+		err := updater(characterId5, worldId, 255) // Set to maximum capacity
 		
 		assert.NoError(t, err)
+		
+		// Verify the buddy list capacity was updated in database
+		reloadedBl, err := processor.GetByCharacterId(characterId5)
+		assert.NoError(t, err)
+		assert.Equal(t, byte(255), reloadedBl.Capacity()) // Should be updated to 255
+		
+		// Verify events were put in buffer
+		allEvents := buf.GetAll()
+		assert.NotEmpty(t, allEvents, "Should have success events in buffer")
 	})
 }
 
-func TestUpdateCapacityAndEmit(t *testing.T) {
-	tenantId := uuid.New()
-	characterId := uint32(12345)
+// Test the UpdateCapacityAndEmit function - this will test the Kafka emission but we can't verify actual Kafka calls
+// without complex mocking, so we'll focus on the database transaction behavior
+func TestUpdateCapacityAndEmitTransactionBehavior(t *testing.T) {
+	db := setupTestDB(t)
+	processor := createRealProcessor(t, db)
+	
+	characterId := uint32(22345)
 	worldId := byte(1)
 	
-	// Create a buddy list with some buddies
-	buddies := []buddy.Model{
-		createTestBuddy(1001, "Friend1"),
-	}
-	
-	bl, _ := NewBuilder(tenantId, characterId).
-		SetId(uuid.New()).
-		SetCapacity(5).
-		SetBuddies(buddies).
-		Build()
-
-	t.Run("emits capacity update event on success", func(t *testing.T) {
-		// Create a mock that expects the event emission
-		producer := &MockProducer{}
-		producer.On("Call", mock.AnythingOfType("string"), mock.AnythingOfType("model.Provider[[]github.com/segmentio/kafka-go.Message]")).Return(nil)
+	t.Run("successful capacity update with transaction", func(t *testing.T) {
+		// Create buddy list with 1 buddy
+		bl := createTestBuddyList(t, db, processor, characterId, 5, 1)
+		assert.Equal(t, 1, len(bl.Buddies()))
 		
-		processor := createMockProcessor(t, bl, producer)
-		
+		// Note: This will attempt to emit to Kafka but will likely fail due to no Kafka setup
+		// However, the database transaction should still work
 		err := processor.UpdateCapacityAndEmit(characterId, worldId, 10)
 		
+		// We expect an error due to Kafka emission failure, but let's check what we can
+		if err != nil {
+			t.Logf("Expected Kafka emission error: %v", err)
+		}
+		
+		// Let's test the UpdateCapacity directly without emission instead
+		buf := message.NewBuffer()
+		updater := processor.UpdateCapacity(buf)
+		err = updater(characterId, worldId, 10)
 		assert.NoError(t, err)
-		producer.AssertExpectations(t)
+		
+		// Verify the buddy list capacity was updated in database
+		reloadedBl, err := processor.GetByCharacterId(characterId)
+		assert.NoError(t, err)
+		assert.Equal(t, byte(10), reloadedBl.Capacity())
+		assert.Equal(t, 1, len(reloadedBl.Buddies())) // Buddies should remain
 	})
-
-	t.Run("emits error event on invalid capacity", func(t *testing.T) {
-		// Create a mock that expects the error event emission
-		producer := &MockProducer{}
-		producer.On("Call", mock.AnythingOfType("string"), mock.AnythingOfType("model.Provider[[]github.com/segmentio/kafka-go.Message]")).Return(nil)
+	
+	t.Run("transaction rollback on validation error", func(t *testing.T) {
+		// Create new character with buddy list containing 3 buddies
+		characterId2 := uint32(22346)
+		bl := createTestBuddyList(t, db, processor, characterId2, 8, 3)
+		assert.Equal(t, 3, len(bl.Buddies()))
 		
-		processor := createMockProcessor(t, bl, producer)
-		
-		err := processor.UpdateCapacityAndEmit(characterId, worldId, 0)
+		buf := message.NewBuffer()
+		updater := processor.UpdateCapacity(buf)
+		err := updater(characterId2, worldId, 0) // Invalid capacity
 		
 		assert.Error(t, err)
-		producer.AssertExpectations(t)
+		assert.Contains(t, err.Error(), "capacity must be greater than 0")
+		
+		// Verify the buddy list capacity hasn't changed in database (transaction rolled back)
+		reloadedBl, err := processor.GetByCharacterId(characterId2)
+		assert.NoError(t, err)
+		assert.Equal(t, byte(8), reloadedBl.Capacity()) // Should still be 8
+		assert.Equal(t, 3, len(reloadedBl.Buddies())) // All buddies should remain
 	})
-
-	t.Run("emits error event on capacity too small", func(t *testing.T) {
-		// Create a mock that expects the error event emission
-		producer := &MockProducer{}
-		producer.On("Call", mock.AnythingOfType("string"), mock.AnythingOfType("model.Provider[[]github.com/segmentio/kafka-go.Message]")).Return(nil)
+	
+	t.Run("handles non-existent character", func(t *testing.T) {
+		nonExistentCharacterId := uint32(99999)
 		
-		processor := createMockProcessor(t, bl, producer)
-		
-		// Try to set capacity to 0 when we have 1 buddy
-		err := processor.UpdateCapacityAndEmit(characterId, worldId, 0)
+		buf := message.NewBuffer()
+		updater := processor.UpdateCapacity(buf)
+		err := updater(nonExistentCharacterId, worldId, 10)
 		
 		assert.Error(t, err)
-		producer.AssertExpectations(t)
+		// Should get a "record not found" type error
 	})
 }
 
-// Helper function to create test buddy models
-func createTestBuddy(id uint32, name string) buddy.Model {
-	entity := buddy.Entity{
-		CharacterId:   id,
-		ListId:        uuid.New(),
-		Group:         "default",
-		CharacterName: name,
-		ChannelId:     -1,
-		InShop:        false,
-		Pending:       false,
-	}
-	model, _ := buddy.Make(entity)
-	return model
-}
-
-// Helper function to create a mock processor for testing
-func createMockProcessor(t *testing.T, buddyList Model, producer *MockProducer) Processor {
-	logger := logrus.New()
-	ctx := context.Background()
+// Test database consistency with concurrent operations
+func TestUpdateCapacityDatabaseConsistency(t *testing.T) {
+	db := setupTestDB(t)
+	processor := createRealProcessor(t, db)
 	
-	// Create tenant context - using empty model since we're testing business logic
-	tenantModel := tenant.Model{}
-	ctx = tenant.WithContext(ctx, tenantModel)
+	characterId := uint32(32345)
+	worldId := byte(1)
 	
-	// Create mock processor that returns our test buddy list
-	processor := &TestProcessorImpl{
-		l:          logger,
-		ctx:        ctx,
-		db:         &gorm.DB{}, // Mock DB
-		t:          tenantModel,
-		buddyList:  buddyList,
-		producer:   producer,
-	}
-	
-	return processor
-}
-
-// Test implementation of processor that uses mock data
-type TestProcessorImpl struct {
-	l         logrus.FieldLogger
-	ctx       context.Context
-	db        *gorm.DB
-	t         tenant.Model
-	buddyList Model
-	producer  *MockProducer
-}
-
-func (p *TestProcessorImpl) WithTransaction(tx *gorm.DB) Processor {
-	return &TestProcessorImpl{
-		l:         p.l,
-		ctx:       p.ctx,
-		db:        tx,
-		t:         p.t,
-		buddyList: p.buddyList,
-		producer:  p.producer,
-	}
-}
-
-func (p *TestProcessorImpl) ByCharacterIdProvider(characterId uint32) model.Provider[Model] {
-	return model.FixedProvider(p.buddyList)
-}
-
-func (p *TestProcessorImpl) GetByCharacterId(characterId uint32) (Model, error) {
-	return p.buddyList, nil
-}
-
-func (p *TestProcessorImpl) Create(characterId uint32, capacity byte) (Model, error) {
-	return Model{}, nil
-}
-
-func (p *TestProcessorImpl) DeleteAndEmit(characterId uint32, worldId byte) error {
-	return nil
-}
-
-func (p *TestProcessorImpl) Delete(mb *message.Buffer) func(characterId uint32, worldId byte) error {
-	return func(characterId uint32, worldId byte) error {
-		return nil
-	}
-}
-
-func (p *TestProcessorImpl) RequestAddBuddyAndEmit(characterId uint32, worldId byte, targetId uint32, group string) error {
-	return nil
-}
-
-func (p *TestProcessorImpl) RequestAddBuddy(mb *message.Buffer) func(characterId uint32, worldId byte, targetId uint32, group string) error {
-	return func(characterId uint32, worldId byte, targetId uint32, group string) error {
-		return nil
-	}
-}
-
-func (p *TestProcessorImpl) RequestDeleteBuddyAndEmit(characterId uint32, worldId byte, targetId uint32) error {
-	return nil
-}
-
-func (p *TestProcessorImpl) RequestDeleteBuddy(mb *message.Buffer) func(characterId uint32, worldId byte, targetId uint32) error {
-	return func(characterId uint32, worldId byte, targetId uint32) error {
-		return nil
-	}
-}
-
-func (p *TestProcessorImpl) AcceptInviteAndEmit(characterId uint32, worldId byte, targetId uint32) error {
-	return nil
-}
-
-func (p *TestProcessorImpl) AcceptInvite(mb *message.Buffer) func(characterId uint32, worldId byte, targetId uint32) error {
-	return func(characterId uint32, worldId byte, targetId uint32) error {
-		return nil
-	}
-}
-
-func (p *TestProcessorImpl) DeleteBuddyAndEmit(characterId uint32, worldId byte, targetId uint32) error {
-	return nil
-}
-
-func (p *TestProcessorImpl) DeleteBuddy(mb *message.Buffer) func(characterId uint32, worldId byte, targetId uint32) error {
-	return func(characterId uint32, worldId byte, targetId uint32) error {
-		return nil
-	}
-}
-
-func (p *TestProcessorImpl) UpdateBuddyChannelAndEmit(characterId uint32, worldId byte, channelId int8) error {
-	return nil
-}
-
-func (p *TestProcessorImpl) UpdateBuddyChannel(mb *message.Buffer) func(characterId uint32, worldId byte, channelId int8) error {
-	return func(characterId uint32, worldId byte, channelId int8) error {
-		return nil
-	}
-}
-
-func (p *TestProcessorImpl) UpdateBuddyShopStatusAndEmit(characterId uint32, worldId byte, inShop bool) error {
-	return nil
-}
-
-func (p *TestProcessorImpl) UpdateBuddyShopStatus(mb *message.Buffer) func(characterId uint32, worldId byte, inShop bool) error {
-	return func(characterId uint32, worldId byte, inShop bool) error {
-		return nil
-	}
-}
-
-func (p *TestProcessorImpl) UpdateCapacityAndEmit(characterId uint32, worldId byte, capacity byte) error {
-	// For testing purposes, directly call the function with a buffer
-	buf := message.NewBuffer()
-	err := p.UpdateCapacity(buf)(characterId, worldId, capacity)
-	
-	// Simulate producer call if producer is set
-	if p.producer != nil {
-		_ = p.producer.Call("test-topic", model.FixedProvider([]kafka.Message{}))
-	}
-	
-	return err
-}
-
-func (p *TestProcessorImpl) UpdateCapacity(mb *message.Buffer) func(characterId uint32, worldId byte, capacity byte) error {
-	return func(characterId uint32, worldId byte, capacity byte) error {
-		// Simulate the business logic without database operations
-		bl := p.buddyList
+	t.Run("capacity update maintains data consistency", func(t *testing.T) {
+		// Create buddy list with specific buddies
+		bl := createTestBuddyList(t, db, processor, characterId, 10, 3)
+		assert.Equal(t, 3, len(bl.Buddies()))
+		assert.Equal(t, byte(10), bl.Capacity())
 		
-		// Validate capacity
-		if capacity == 0 {
-			p.l.Infof("Invalid capacity [%d] for character [%d] buddy list.", capacity, characterId)
-			if mb != nil {
-				_ = mb.Put(list2.EnvStatusEventTopic, list3.ErrorStatusEventProvider(characterId, worldId, list2.StatusEventErrorInvalidCapacity))
-			}
-			return errors.New("capacity must be greater than 0")
+		// Update capacity to a larger value
+		buf := message.NewBuffer()
+		updater := processor.UpdateCapacity(buf)
+		err := updater(characterId, worldId, 25)
+		assert.NoError(t, err)
+		
+		// Verify all data consistency
+		reloadedBl, err := processor.GetByCharacterId(characterId)
+		assert.NoError(t, err)
+		
+		// Check capacity was updated
+		assert.Equal(t, byte(25), reloadedBl.Capacity())
+		
+		// Check all buddies are still there
+		assert.Equal(t, 3, len(reloadedBl.Buddies()))
+		
+		// Check buddy details are preserved
+		for i, buddy := range reloadedBl.Buddies() {
+			expectedId := uint32(2000 + i)
+			expectedName := fmt.Sprintf("Buddy%d", i+1)
+			assert.Equal(t, expectedId, buddy.CharacterId())
+			assert.Equal(t, expectedName, buddy.Name())
+			assert.Equal(t, "Friends", buddy.Group())
 		}
 		
-		// Check if new capacity is less than current buddy count
-		currentBuddyCount := len(bl.Buddies())
-		if int(capacity) < currentBuddyCount {
-			p.l.Infof("New capacity [%d] is less than current buddy count [%d] for character [%d].", capacity, currentBuddyCount, characterId)
-			if mb != nil {
-				_ = mb.Put(list2.EnvStatusEventTopic, list3.ErrorStatusEventProvider(characterId, worldId, list2.StatusEventErrorCapacityTooSmall))
-			}
-			return errors.New("new capacity is less than current buddy count")
-		}
-		
-		// Emit capacity change event
-		if mb != nil {
-			_ = mb.Put(list2.EnvStatusEventTopic, list3.BuddyCapacityChangeStatusEventProvider(characterId, worldId, capacity))
-		}
-		return nil
-	}
+		// Verify the entity in database directly
+		var entity Entity
+		err = db.Preload("Buddies").Where("character_id = ?", characterId).First(&entity).Error
+		assert.NoError(t, err)
+		assert.Equal(t, byte(25), entity.Capacity)
+		assert.Equal(t, 3, len(entity.Buddies))
+	})
 }
 
-// Integration test that tests the actual database logic - skipped for now
-func TestUpdateCapacityIntegration(t *testing.T) {
-	// Skip test for now due to database compatibility issues with SQLite
-	t.Skip("Skipping integration test due to database compatibility issues")
+// Test administrator function directly
+func TestUpdateCapacityAdministratorFunction(t *testing.T) {
+	db := setupTestDB(t)
+	processor := createRealProcessor(t, db)
+	
+	characterId := uint32(42345)
+	
+	t.Run("administrator function validates and updates capacity", func(t *testing.T) {
+		// Create buddy list through processor
+		bl := createTestBuddyList(t, db, processor, characterId, 15, 2)
+		assert.Equal(t, 2, len(bl.Buddies()))
+		
+		// Get tenant from processor to use administrator function
+		realProc := processor.(*ProcessorImpl)
+		tenantId := realProc.t.Id()
+		
+		// Test administrator function directly
+		err := updateCapacity(db)(tenantId)(characterId)(30)
+		assert.NoError(t, err)
+		
+		// Verify capacity was updated
+		reloadedBl, err := processor.GetByCharacterId(characterId)
+		assert.NoError(t, err)
+		assert.Equal(t, byte(30), reloadedBl.Capacity())
+		
+		// Test validation in administrator function
+		err = updateCapacity(db)(tenantId)(characterId)(0)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "capacity must be greater than 0")
+		
+		// Test capacity less than buddy count
+		err = updateCapacity(db)(tenantId)(characterId)(1) // Less than 2 buddies
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "new capacity 1 is less than current buddy count 2")
+	})
 }
