@@ -5,6 +5,13 @@ Mushroom game buddies Service
 
 A RESTful resource which provides buddies services.
 
+### Features
+
+- **Buddy List Management**: Create and retrieve character buddy lists with configurable capacity
+- **Dynamic Capacity Updates**: Modify buddy list capacity with validation and constraints
+- **Real-time Buddy Status**: Track buddy online status, channel, and shop presence
+- **Event-Driven Architecture**: Kafka-based messaging for real-time updates and commands
+
 ## Environment
 
 - JAEGER_HOST_PORT - Jaeger [host]:[port]
@@ -22,6 +29,34 @@ A RESTful resource which provides buddies services.
 - EVENT_TOPIC_CASH_SHOP_STATUS - Kafka Topic for receiving cash shop status events.
 - EVENT_TOPIC_CHARACTER_STATUS - Kafka Topic for receiving character status events.
 - EVENT_TOPIC_INVITE_STATUS - Kafka Topic for receiving invite status events.
+
+## Kafka Integration
+
+The service uses Kafka for asynchronous command processing and event publishing:
+
+### Commands Consumed
+- **UPDATE_CAPACITY**: Updates buddy list capacity with validation
+
+### Events Published
+- **BUDDY_LIST_STATUS**: Status updates for buddy list operations
+
+### Message Processing
+All commands are processed asynchronously with proper error handling and validation. Status events are published to notify other services of state changes.
+
+## Database Schema
+
+### Buddy Lists
+- **ID**: UUID primary key
+- **Tenant ID**: Multi-tenancy identifier
+- **Character ID**: Owner character identifier (uint32)
+- **Capacity**: Maximum buddy count (1-255, default 50)
+- **Created At**: Timestamp of list creation
+
+### Capacity Constraints
+- Minimum capacity: 1 buddy
+- Maximum capacity: 255 buddies
+- New capacity must be >= current buddy count
+- Capacity updates are atomic operations
 
 ## API
 
