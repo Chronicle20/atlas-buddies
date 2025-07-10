@@ -5,6 +5,13 @@ Mushroom game buddies Service
 
 A RESTful resource which provides buddies services.
 
+### Features
+
+- **Buddy List Management**: Create and retrieve character buddy lists with configurable capacity
+- **Dynamic Capacity Updates**: Modify buddy list capacity with validation and constraints
+- **Real-time Buddy Status**: Track buddy online status, channel, and shop presence
+- **Event-Driven Architecture**: Kafka-based messaging for real-time updates and commands
+
 ## Environment
 
 - JAEGER_HOST_PORT - Jaeger [host]:[port]
@@ -22,6 +29,34 @@ A RESTful resource which provides buddies services.
 - EVENT_TOPIC_CASH_SHOP_STATUS - Kafka Topic for receiving cash shop status events.
 - EVENT_TOPIC_CHARACTER_STATUS - Kafka Topic for receiving character status events.
 - EVENT_TOPIC_INVITE_STATUS - Kafka Topic for receiving invite status events.
+
+## Kafka Integration
+
+The service uses Kafka for asynchronous command processing and event publishing:
+
+### Commands Consumed
+- **UPDATE_CAPACITY**: Updates buddy list capacity with validation
+
+### Events Published
+- **BUDDY_LIST_STATUS**: Status updates for buddy list operations
+
+### Message Processing
+All commands are processed asynchronously with proper error handling and validation. Status events are published to notify other services of state changes.
+
+## Database Schema
+
+### Buddy Lists
+- **ID**: UUID primary key
+- **Tenant ID**: Multi-tenancy identifier
+- **Character ID**: Owner character identifier (uint32)
+- **Capacity**: Maximum buddy count (1-255, default 50)
+- **Created At**: Timestamp of list creation
+
+### Capacity Constraints
+- Minimum capacity: 1 buddy
+- Maximum capacity: 255 buddies
+- New capacity must be >= current buddy count
+- Capacity updates are atomic operations
 
 ## API
 
@@ -150,3 +185,32 @@ Example Request:
 ```
 
 Response: 202 Accepted (No content)
+
+#### [PUT] Update Character's Buddy List Capacity
+
+```/api/characters/{characterId}/buddy-list/capacity```
+
+Updates the maximum capacity of a character's buddy list. The new capacity must be between 1-255 and cannot be less than the current number of buddies in the list.
+
+Example Request:
+```json
+{
+  "data": {
+    "type": "buddy-list",
+    "attributes": {
+      "capacity": 100
+    }
+  }
+}
+```
+
+Response: 202 Accepted (No content)
+
+**Error Responses:**
+- **400 Bad Request**: Invalid capacity (zero or missing)
+- **500 Internal Server Error**: Server error processing the request
+
+**Validation Rules:**
+- Capacity must be between 1-255
+- New capacity must be greater than or equal to the current number of buddies in the list
+- Request is processed asynchronously via Kafka messaging

@@ -20,3 +20,15 @@ func (m Model) Buddies() []buddy.Model {
 func (m Model) Capacity() byte {
 	return m.capacity
 }
+
+func (m Model) Id() uuid.UUID {
+	return m.id
+}
+
+func (m Model) TenantId() uuid.UUID {
+	return m.tenantId
+}
+
+func (m Model) CharacterId() uint32 {
+	return m.characterId
+}
