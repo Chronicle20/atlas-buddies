@@ -7,20 +7,21 @@ import (
 	list3 "atlas-buddies/kafka/producer/list"
 	"atlas-buddies/rest"
 	"errors"
+	"net/http"
+
 	"github.com/Chronicle20/atlas-model/model"
 	"github.com/Chronicle20/atlas-rest/server"
 	"github.com/gorilla/mux"
 	"github.com/jtumidanski/api2go/jsonapi"
 	"github.com/sirupsen/logrus"
 	"gorm.io/gorm"
-	"net/http"
 )
 
 const (
-	GetBuddyList          = "get_buddy_list"
-	CreateBuddyList       = "create_buddy_list"
-	GetBuddiesInBuddyList = "get_buddies_in_buddy_list"
-	AddBuddyToBuddyList   = "add_buddy_to_buddy_list"
+	GetBuddyList            = "get_buddy_list"
+	CreateBuddyList         = "create_buddy_list"
+	GetBuddiesInBuddyList   = "get_buddies_in_buddy_list"
+	AddBuddyToBuddyList     = "add_buddy_to_buddy_list"
 	UpdateBuddyListCapacity = "update_buddy_list_capacity"
 )
 
