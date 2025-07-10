@@ -150,3 +150,32 @@ Example Request:
 ```
 
 Response: 202 Accepted (No content)
+
+#### [PUT] Update Character's Buddy List Capacity
+
+```/api/characters/{characterId}/buddy-list/capacity```
+
+Updates the maximum capacity of a character's buddy list. The new capacity must be between 1-255 and cannot be less than the current number of buddies in the list.
+
+Example Request:
+```json
+{
+  "data": {
+    "type": "buddy-list",
+    "attributes": {
+      "capacity": 100
+    }
+  }
+}
+```
+
+Response: 202 Accepted (No content)
+
+**Error Responses:**
+- **400 Bad Request**: Invalid capacity (zero or missing)
+- **500 Internal Server Error**: Server error processing the request
+
+**Validation Rules:**
+- Capacity must be between 1-255
+- New capacity must be greater than or equal to the current number of buddies in the list
+- Request is processed asynchronously via Kafka messaging
